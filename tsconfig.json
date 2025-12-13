@@ -1,6 +1,7 @@
 {
 	"compilerOptions": {
 		"baseUrl": ".",
+		"skipLibCheck": true,
 		"inlineSourceMap": true,
 		"inlineSources": true,
 		"module": "ESNext",
@@ -25,4 +26,8 @@
 		"**/*.ts",
 		"src/assets/**/*.json"
 	],
+	"exclude": [
+		"scripts/**/*",
+		"node_modules/bun-types/**/*"
+	]
 }

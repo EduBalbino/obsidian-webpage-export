@@ -6,6 +6,7 @@
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"go": "bun run scripts/full-deploy.ts",
 		"version": "node version-bump.mjs && git add manifest.json versions.json"
 	},
 	"keywords": [],
@@ -28,7 +29,8 @@
 		"obsidian-dataview": "^0.5.64",
 		"tslib": "2.4.0",
 		"typescript": "4.7.4",
-		"typescript-eslint": "^7.7.0"
+		"typescript-eslint": "^7.7.0",
+		"puppeteer-core": "^24.33.0"
 	},
 	"dependencies": {
 		"file-type": "^19.0.0",

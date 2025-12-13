@@ -34,3 +34,6 @@ dist
 todo.txt
 vault/
 output/
+
+# Environment config (personal paths)
+.env
