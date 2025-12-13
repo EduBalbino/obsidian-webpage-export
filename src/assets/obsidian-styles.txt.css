@@ -147,6 +147,29 @@ h1:hover .collapse-indicator, h2:hover .collapse-indicator, h3:hover .collapse-i
     margin-right: unset;
 }
 
+/* Fix: mjx-container with display:inline reports clientWidth as 0.
+   Only override inline display, preserve native flex/block displays. */
+.canvas-node mjx-container:not([display]) {
+    display: inline-block !important;
+}
+
+/* Fix: P tags have overflow:auto on website vs overflow:visible in Obsidian.
+   When P has overflow:auto, scroll content gets "captured" inside P and doesn't
+   propagate to the parent sizer. */
+.canvas-node p,
+.canvas-node .el-p,
+.canvas-node .el-p p {
+    overflow: visible !important;
+}
+
+/* Fix: deferred.txt.css adds overflow-x:auto to elements with .math children via
+   :has(> .math) selector. This creates scroll containers inside canvas nodes that
+   affect scrollHeight. Override to visible for canvas nodes. */
+.canvas-node .el-div:has(> .math),
+.canvas-node :has(> .math) {
+    overflow: visible !important;
+}
+
 /*#endregion */
 
 /*#region Code Copy */
