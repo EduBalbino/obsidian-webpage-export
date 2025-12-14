@@ -1,0 +1,12 @@
+FROM oven/bun:1
+
+WORKDIR /app
+
+# Copy all website files
+COPY . .
+
+# Expose port 8810
+EXPOSE 8810
+
+# Run the server
+CMD ["bun", "run", "index.ts"]

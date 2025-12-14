@@ -774,6 +774,8 @@ export class Path
 
 	async write(data: string | NodeJS.ArrayBufferView | Iterable<string | NodeJS.ArrayBufferView> | AsyncIterable<string | NodeJS.ArrayBufferView> | internal.Stream, encoding: "ascii" | "utf8" | "utf-8" | "utf16le" | "ucs2" | "ucs-2" | "base64" | "base64url" | "latin1" | "binary" | "hex" = "utf-8"): Promise<boolean>
 	{
+		// Note: isDirectory is based on extension, so extensionless files like "Dockerfile" are treated as dirs
+		// Use writeForce() for files without extensions
 		if (this.isDirectory) return false;
 
 		try
@@ -794,6 +796,35 @@ export class Path
 			catch (error)
 			{
 				Path.log("Error writing file: " + this.pathname, error, "error");
+				return false;
+			}
+		}
+	}
+
+	/**
+	 * Write data to file, bypassing the isDirectory check.
+	 * Use this for extensionless files like "Dockerfile" that are incorrectly detected as directories.
+	 */
+	async writeForce(data: string | NodeJS.ArrayBufferView, encoding: "ascii" | "utf8" | "utf-8" | "utf16le" | "ucs2" | "ucs-2" | "base64" | "base64url" | "latin1" | "binary" | "hex" = "utf-8"): Promise<boolean>
+	{
+		try
+		{
+			await fs.writeFile(this.absoluted().pathname, data, { encoding: encoding });
+			return true;
+		}
+		catch (error)
+		{
+			// Try creating directory first
+			const dirPath = this.absoluted().directory.path;
+			try
+			{
+				await fs.mkdir(dirPath, { recursive: true });
+				await fs.writeFile(this.absoluted().pathname, data, { encoding: encoding });
+				return true;
+			}
+			catch (innerError)
+			{
+				Path.log("Error writing file (force): " + this.pathname, innerError, "error");
 				return false;
 			}
 		}

@@ -6,6 +6,8 @@ import { Website } from "src/plugin/website/website";
 import { ExportLog, MarkdownRendererAPI } from "src/plugin/render-api/render-api";
 import { ExportInfo, ExportModal } from "src/plugin/settings/export-modal";
 import { Webpage } from "./website/webpage";
+import dockerfileContent from "src/deploy/Dockerfile.txt";
+import serverIndexContent from "src/deploy/server.txt";
 
 export class HTMLExporter
 {
@@ -101,6 +103,9 @@ export class HTMLExporter
 						await Utils.downloadAttachments([website.index.websiteDataAttachment()]);
 						await Utils.downloadAttachments([website.index.indexDataAttachment()]);
 					}
+
+					// Copy deploy files (Dockerfile and server script)
+					await HTMLExporter.copyDeployFiles(destination);
 				}
 			}
 		}
@@ -130,4 +135,23 @@ export class HTMLExporter
 		return await this.exportFiles(files, rootExportPath, saveFiles, clearDirectory);
 	}
 
+	private static async copyDeployFiles(destination: Path): Promise<void>
+	{
+		try
+		{
+			// Write Dockerfile (use writeForce since Path treats extensionless files as directories)
+			const dockerfilePath = destination.joinString("Dockerfile");
+			await dockerfilePath.writeForce(dockerfileContent);
+			ExportLog.log("Copied Dockerfile to export", dockerfilePath.path);
+
+			// Write server index.ts
+			const serverPath = destination.joinString("index.ts");
+			await serverPath.write(serverIndexContent);
+			ExportLog.log("Copied index.ts to export", serverPath.path);
+		}
+		catch (e)
+		{
+			ExportLog.warning(e, "Failed to copy deploy files");
+		}
+	}
 }

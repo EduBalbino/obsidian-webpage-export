@@ -1,0 +1,54 @@
+#!/usr/bin/env bun
+/**
+ * Standalone server for exported Obsidian website
+ * Run with: bun run index.ts
+ */
+
+import { serve, file } from "bun";
+import { join } from "path";
+
+const PORT = 8810;
+const STATIC_DIR = process.cwd();
+
+// Find the default page (first .html file or index.html)
+async function findDefaultPage(): Promise<string> {
+  const glob = new Bun.Glob("*.html");
+  for await (const entry of glob.scan({ cwd: STATIC_DIR })) {
+    if (entry === "index.html") return "/index.html";
+  }
+  for await (const entry of glob.scan({ cwd: STATIC_DIR })) {
+    return "/" + entry;
+  }
+  return "/index.html";
+}
+
+async function main() {
+  const defaultPage = await findDefaultPage();
+  
+  const server = serve({
+    port: PORT,
+    async fetch(req) {
+      let path = decodeURIComponent(new URL(req.url).pathname);
+      if (path === "/" || path === "") path = defaultPage;
+      
+      const fullPath = join(STATIC_DIR, path);
+      const f = file(fullPath);
+      
+      if (await f.exists()) {
+        return new Response(f, {
+          headers: { "Content-Type": f.type || "application/octet-stream" },
+        });
+      }
+      return new Response("Not Found", { status: 404 });
+    },
+  });
+  
+  console.log(`🌐 Server running at http://localhost:${PORT}`);
+  console.log(`   Default page: ${defaultPage}`);
+  console.log(`   Serving from: ${STATIC_DIR}`);
+}
+
+main().catch(e => {
+  console.error("Fatal:", e.message);
+  process.exit(1);
+});
