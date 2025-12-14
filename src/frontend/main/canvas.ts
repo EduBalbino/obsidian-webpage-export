@@ -26,60 +26,39 @@ export class CanvasNode
 	public document: WebpageDocument;
 	public isFocused: boolean = false;
 
-	public get size(): Vector2
-	{
-		return new Vector2(parseFloat(this.nodeEl.style.width.replace("px", "")), parseFloat(this.nodeEl.style.height.replace("px", "")));
-	}
+	// Cached at construction - nodes don't move during zoom/pan
+	private _localPosition: Vector2;
+	private _localSize: Vector2;
+
+	public get size(): Vector2 { return this._localSize; }
 
 	public set size(newSize: Vector2)
 	{
+		this._localSize = newSize;
 		this.nodeEl.style.width = newSize.x + "px";
 		this.nodeEl.style.height = newSize.y + "px";
 		this.nodeEl.style.setProperty("--canvas-node-width", newSize.x + "px");
 		this.nodeEl.style.setProperty("--canvas-node-height", newSize.y + "px");
 	}
 
-	public get position(): Vector2
-	{
-		// ex. transform: translate(1600px, 10550px);
-		const transform = this.nodeEl.style.transform;
-		const match = transform.match(/translate\(([^,]+)px, ([^,]+)px\)/);
-
-		const translate = this.nodeEl.style.translate;
-		const match2 = translate.match(/([^,]+)px ([^,]+)px/);
-
-		// add together the two translations
-		let x = 0;
-		let y = 0;
-		if (match)
-		{
-			x += parseFloat(match[1]);
-			y += parseFloat(match[2]);
-		}
-
-		if (match2)
-		{
-			x += parseFloat(match2[1]);
-			y += parseFloat(match2[2]);
-		}
-
-		return new Vector2(x, y);
-	}
+	public get position(): Vector2 { return this._localPosition; }
 
 	public set position(newPos: Vector2)
 	{
+		this._localPosition = newPos;
 		this.nodeEl.style.transform = `translate(${newPos.x}px, ${newPos.y}px)`;
 	}
 
 	public get bounds(): Bounds
 	{
-		let bounds = new Bounds(0, 0, 0, 0);
-		let size = this.size.scale(this.canvas.scale);
-		let position = this.position.scale(this.canvas.scale).add(this.canvas.position);
-
-		bounds.position = position;
-		bounds.size = size;
-		return bounds;
+		const scale = this.canvas.scale;
+		const pos = this.canvas.position;
+		return new Bounds(
+			this._localPosition.x * scale + pos.x,
+			this._localPosition.y * scale + pos.y,
+			this._localSize.x * scale,
+			this._localSize.y * scale
+		);
 	}
 
 	public get label(): string
@@ -113,6 +92,13 @@ export class CanvasNode
 		this.containerEl = nodeEl.querySelector(".canvas-node-container") as HTMLElement;
 		this.contentEl = nodeEl.querySelector(".canvas-node-content") as HTMLElement;
 
+		// Parse position/size once from CSS (they don't change during zoom/pan)
+		this._localSize = new Vector2(
+			parseFloat(nodeEl.style.width.replace("px", "")) || 0,
+			parseFloat(nodeEl.style.height.replace("px", "")) || 0
+		);
+		this._localPosition = this.parsePositionFromCSS();
+
 		if (!this.containerEl || !this.contentEl)
 		{
 			console.error("Failed to find all required elements for canvas node", this);
@@ -145,6 +131,19 @@ export class CanvasNode
 		// }
 
 		this.initEvents();
+	}
+
+	private parsePositionFromCSS(): Vector2
+	{
+		const transform = this.nodeEl.style.transform;
+		const match = transform.match(/translate\(([^,]+)px, ([^,]+)px\)/);
+		const translate = this.nodeEl.style.translate;
+		const match2 = translate.match(/([^,]+)px ([^,]+)px/);
+
+		let x = 0, y = 0;
+		if (match) { x += parseFloat(match[1]); y += parseFloat(match[2]); }
+		if (match2) { x += parseFloat(match2[1]); y += parseFloat(match2[2]); }
+		return new Vector2(x, y);
 	}
 
 	public focus(force: boolean = true)
@@ -194,28 +193,51 @@ export class Canvas
 {
 	public document: WebpageDocument;
 	public nodes: CanvasNode[];
-	public hiddenNodes: CanvasNode[] = [];
 	public canvasEl: HTMLElement;
 	public wrapperEl: HTMLElement;
 	public backgroundEl: HTMLElement;
 	public backgroundDotEl: SVGCircleElement;
 	public focusedNode: CanvasNode | null = null;
 
+	// Cache to avoid redundant CSS updates
+	private _lastSmallScale: boolean = false;
+
+	// Cache wrapper rect to avoid getBoundingClientRect() in hot path
+	private _wrapperRect: DOMRect | null = null;
+	private _updateWrapperRect = () => { 
+		this._wrapperRect = this.wrapperEl.getBoundingClientRect(); 
+	};
+
+	// Animation state - RAF loop only runs when animating
+	private _isAnimating: boolean = false;
+	private readonly _tick = (t: number) => this.updateScale(t);
+
+	/** Starts animation loop if not already running */
+	private startAnimation(): void {
+		if (!this._isAnimating) {
+			this._isAnimating = true;
+			this.lastTime = 0;
+			requestAnimationFrame(this._tick);
+		}
+	}
+
 	private _renderScale = 1;
 	public get renderScale(): number { return this._renderScale; }
 	public set renderScale(scale: number)
 	{
 		this._renderScale = scale;
-		//@ts-ignore
-		this.canvasEl.style.zoom = (scale * 100) + "%";
-		this.scale = this._scale;
-		this.position = this._position;
+		// renderScale now just triggers a transform update
+		this.applyTransform();
 	}
 
 
 	public get nodeBounds(): Bounds
 	{
-		if (this.nodes.length == 0) return new Bounds(0, 0, 0, 0);
+		performance.mark('nodeBounds-start');
+		if (this.nodes.length == 0) {
+			performance.mark('nodeBounds-end');
+			return new Bounds(0, 0, 0, 0);
+		}
 		const bounds = this.nodes[0].bounds;
 
 		for (const node of this.nodes)
@@ -223,6 +245,7 @@ export class Canvas
 			bounds.encapsulate(node.bounds);
 		};
 
+		performance.mark('nodeBounds-end');
 		return bounds;
 	}
 
@@ -242,22 +265,23 @@ export class Canvas
 	{
 		newScale = Math.min(Math.max(newScale, this.minScale), this.maxScale);
 		this._targetScale = newScale;
+		this.startAnimation();
 	}
 	
 	private _scale: number = 1;
 	public get scale(): number { return this._scale; }
 	private set scale(newScale: number)
 	{
-		let ratio = newScale / this._scale;
+		const ratio = newScale / this._scale;
 		this._scale = newScale;
-		let scaled = newScale / this.renderScale;
-		const scaleStr = scaled.toString() ?? "1";
-		this.canvasEl.style.scale = scaleStr;
-		const zoomStr = (1/(Math.sqrt(newScale))).toString() ?? "1";
-		this.wrapperEl.style.setProperty("--zoom-multiplier",  zoomStr);
-
-		this.canvasEl.classList.toggle("small-scale", this.scale < 0.15);
-
+		
+		const isSmallScale = newScale < 0.15;
+		if (this._lastSmallScale !== isSmallScale) {
+			this._lastSmallScale = isSmallScale;
+			this.canvasEl.classList.toggle("small-scale", isSmallScale);
+		}
+		
+		// Note: applyTransform() is called in updateScale() to batch updates
 		this.backgroundScale = this.backgroundScale * ratio;
 	}
 
@@ -267,6 +291,7 @@ export class Canvas
 	public set targetPosition(screenPos: Vector2)
 	{
 		this._targetPosition = screenPos;
+		this.startAnimation();
 	}
 
 	private _position: Vector2 = new Vector2(0, 0);
@@ -274,9 +299,18 @@ export class Canvas
 	public set position(screenPos: Vector2)
 	{
 		this._position = screenPos;
-		let scaled = screenPos.divide(this.renderScale);
-		this.canvasEl.style.translate = `${scaled.x}px ${scaled.y}px`;
-		this.backgroundPosition = this.position;
+		// Note: applyTransform() is called in updateScale() to batch updates
+		this.backgroundPosition = screenPos;
+	}
+
+	/** Applies position and scale as a single CSS transform */
+	private applyTransform(): void
+	{
+		if (!this.canvasEl) return;
+		const x = this._position.x / this._renderScale;
+		const y = this._position.y / this._renderScale;
+		const s = this._scale / this._renderScale;
+		this.canvasEl.style.transform = `translate(${x}px, ${y}px) scale(${s})`;
 	}
 
 	public set forcePosition(screenPos: Vector2)
@@ -296,14 +330,8 @@ export class Canvas
 	public get backgroundScale(): number { return this._backgroundScale; }
 	public set backgroundScale(newScale: number)
 	{
-		const scaleStr = (newScale).toString()  ?? "20";
-		this.backgroundEl?.setAttribute("width", scaleStr);
-		this.backgroundEl?.setAttribute("height", scaleStr);
 		this._backgroundScale = newScale;
-
-		// lerp opacity based on scale
-		if (this.backgroundEl?.parentElement)
-			this.backgroundEl.parentElement.style.opacity = (1 - mapRangeClamped(this._backgroundScale, this._backgroundBaseScale / 2, this._invisibleBackgroundScale, 0, 1)).toString();
+		this.applyBackgroundTransform();
 	}
 
 	private _backgroundDotSize: number = 1;
@@ -321,10 +349,20 @@ export class Canvas
 	public get backgroundPosition(): Vector2 { return this._backgroundPosition; }
 	public set backgroundPosition(newPosition: Vector2)
 	{
-		if (!this.backgroundEl) return;
-		this.backgroundEl?.setAttribute("x", newPosition.x.toString());
-		this.backgroundEl?.setAttribute("y", newPosition.y.toString());
 		this._backgroundPosition = newPosition;
+		this.applyBackgroundTransform();
+	}
+
+	/** Batch background updates into single transform + opacity write */
+	private applyBackgroundTransform(): void {
+		const parent = this.backgroundEl?.parentElement;
+		if (!parent) return;
+		const s = this._backgroundScale / this._backgroundBaseScale;
+		const x = this._backgroundPosition.x;
+		const y = this._backgroundPosition.y;
+		const opacity = 1 - mapRangeClamped(this._backgroundScale, this._backgroundBaseScale / 2, this._invisibleBackgroundScale, 0, 1);
+		parent.style.transform = `translate(${x}px, ${y}px) scale(${s})`;
+		parent.style.opacity = opacity.toString();
 	}
 
 
@@ -350,10 +388,16 @@ export class Canvas
 		this.wrapperEl = document.documentEl.querySelector(".canvas-wrapper") as HTMLElement;
 		this.backgroundEl = document.documentEl.querySelector(".canvas-background pattern") as HTMLElement;
 		this.backgroundDotEl = this.backgroundEl?.querySelector("circle") as SVGCircleElement;
-		this.canvasEl.setAttribute("style", `translate: 0px 1px; scale: 1;`);
+		// Use transform-origin 0 0 for predictable scaling from top-left
+		this.canvasEl.style.transformOrigin = "0 0";
 		this.backgroundScale = this._backgroundScale;
 		this.backgroundDotSize = this._backgroundDotSize;
 		this.renderScale = this._renderScale;
+
+		// Cache wrapper rect and update on resize/scroll (avoids getBoundingClientRect in hot path)
+		this._updateWrapperRect();
+		new ResizeObserver(this._updateWrapperRect).observe(this.wrapperEl);
+		window.addEventListener("scroll", this._updateWrapperRect, true);
 
 		const nodespaceOffset = Bounds.fromElement(this.canvasEl).min.sub(this.nodeBounds.min);
 		Array.from(this.canvasEl.children).forEach((el) => 
@@ -363,8 +407,6 @@ export class Canvas
 		});
 
 		this.forcePosition = this.nodeBounds.min.sub(this.wrapperBounds.min);
-
-		requestAnimationFrame(this.updateScale.bind(this));
 		
 		this.initEvents();
 
@@ -394,58 +436,28 @@ export class Canvas
 
 		if (this.targetPosition.sub(this.position).magnitude > 0.001)
 			this.position = inOutQuadBlendv(this.position, this.targetPosition, 6 * deltaTime);
-		
-		let screenBounds = Bounds.screenBounds;
 
-		// sort the hidden nodes by their distance from the center of the screen
-		this.hiddenNodes.sort((a, b) => 
-		{
-			const aCenter = a.bounds.center;
-			const bCenter = b.bounds.center;
-			const aDist = aCenter.sub(screenBounds.center).magnitude;
-			const bDist = bCenter.sub(screenBounds.center).magnitude;
-			return aDist - bDist;
-		});
+		// Single CSS transform update per frame (batches scale + position)
+		this.applyTransform();
 
-		// loop through the first 50 hidden nodes and check if they are visible, if they are unset the display
-		for (let i = 0; i < 50; i++)
-		{
-			if (i >= this.hiddenNodes.length) break;
-			const node = this.hiddenNodes[i];
-			if (!node)
-			{
-				this.hiddenNodes.splice(i, 1);
-				continue;
-			}
-			const bounds = node.bounds.expand(100);
-			const isVisible = bounds.overlaps(screenBounds);
-			node.nodeEl.style.display = isVisible ? "" : "none";
-			if (isVisible) this.hiddenNodes.splice(i, 1);
+		// Only continue RAF if still animating toward target
+		const scaleMoving = Math.abs(this.targetScale - this.scale) > 0.0001;
+		const posMoving = this.targetPosition.sub(this.position).magnitude > 0.001;
+		if (scaleMoving || posMoving) {
+			requestAnimationFrame(this._tick);
+		} else {
+			this._isAnimating = false;
 		}
-
-		requestAnimationFrame(this.updateScale.bind(this));
 	}
 
 	private initEvents()
 	{
-		// hide nodes that are not in view
-		const observer = new IntersectionObserver((entries) => 
-		{
-			entries.forEach(entry => 
-			{
-				(entry.target as HTMLElement).style.display = entry.isIntersecting ? '' : 'none';
-				//@ts-ignore
-				if (!entry.isIntersecting) this.hiddenNodes.push((entry.target as HTMLElement).nodeObj);
-			});
-		}, { root: null, rootMargin: '0px', threshold: 0 });
-		this.nodes.forEach((node) => observer.observe(node.nodeEl));
-
 		// make canvas draggable / panable with mouse
 		const localThis = this;
         const isWindows = navigator.userAgent.includes("Windows");
 
 		function getRelativePointerPosition(event: MouseEvent | Touch): Vector2 {
-            const rect = localThis.wrapperEl.getBoundingClientRect();
+            const rect = localThis._wrapperRect!;
             const x = event.clientX - rect.left;
             const y = event.clientY - rect.top;
             return new Vector2(x, y);
@@ -456,10 +468,12 @@ export class Canvas
             const startPointerPos = getRelativePointerPosition(event);
             const startCanvasPos = localThis.position;
             const startingNode = localThis.focusedNode;
+            // Cache scroll state at drag start to avoid layout reads during drag
+            const startingNodeIsScrollable = !!startingNode?.isScrollable;
 
             function drag(dragEvent: MouseEvent) {
                 if (isWindows && 
-                    startingNode?.isScrollable && 
+                    startingNodeIsScrollable && 
                     dragEvent.buttons == 4) return;
 
                 dragEvent.preventDefault();
@@ -572,6 +586,7 @@ export class Canvas
 	/**Sets the relative scale of the canvas around a point*/
 	public scaleAround(scaleBy: number, point: Vector2, instantScale: boolean = false): Vector2
 	{
+		performance.mark('scaleAround-start');
 		// clamp scale by the min and max scale when applied to the current scale
 		const currentScale = this.targetScale;
 		let newScale = currentScale * scaleBy;
@@ -595,6 +610,7 @@ export class Canvas
 			this.targetPosition = this.targetPosition.add(offset);
 		}
 
+		performance.mark('scaleAround-end');
 		return offset;
 	}
 
@@ -605,7 +621,6 @@ export class Canvas
 
 	public fitToBounds(bounds: Bounds = this.nodeBounds, scaleMultiplier: number = 0.9, instant: boolean = false)
 	{
-		this.hideNodesOutsideBounds(bounds.scale(2));
 		const documentWidth = this.document.containerEl.clientWidth;
 		const documentHeight = this.document.containerEl.clientHeight;
 		const xRatio = documentWidth/bounds.width;
@@ -613,18 +628,6 @@ export class Canvas
 		const scale = scaleMultiplier * Math.min(xRatio, yRatio);
 		this.scaleAround(scale, bounds.center, instant);
 		this.centerView(bounds.center, instant);
-	}
-
-	private hideNodesOutsideBounds(bounds: Bounds)
-	{
-		for (const node of this.nodes)
-		{
-			if (!bounds.overlaps(node.bounds))
-			{
-				node.nodeEl.style.display = "none";
-				this.hiddenNodes.push(node);
-			}
-		}
 	}
 
 	/**Sets the absolute center of the view*/

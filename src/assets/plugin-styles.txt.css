@@ -461,12 +461,23 @@ body :is(.canvas-node-container, .canvas-wrapper) {
 
 body .canvas-wrapper {
 	max-width: 100% !important;
+	contain: strict;
 }
 
 .canvas {
-	translate: 0 0;
-	scale: 1 1;
-	will-change: translate, scale;
+	transform: translate(0px, 0px) scale(1);
+	will-change: transform;
+	contain: layout style;
+}
+
+/* Isolate layout recalculation to individual canvas nodes */
+.canvas-node {
+	contain: layout style paint;
+}
+
+.canvas-node-container,
+.canvas-node-content {
+	contain: style;
 }
 
 .canvas-controls {
