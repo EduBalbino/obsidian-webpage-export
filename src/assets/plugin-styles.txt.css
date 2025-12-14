@@ -461,23 +461,36 @@ body :is(.canvas-node-container, .canvas-wrapper) {
 
 body .canvas-wrapper {
 	max-width: 100% !important;
-	contain: strict;
+	contain: paint;
 }
 
 .canvas {
-	transform: translate(0px, 0px) scale(1);
-	will-change: transform;
+	will-change: is-interacting;
 	contain: layout style;
+	background-color: var(--background-primary);
+}
+
+.canvas-background {
+	display: none !important;
 }
 
 /* Isolate layout recalculation to individual canvas nodes */
 .canvas-node {
-	contain: layout style paint;
+	contain: layout style;
 }
 
 .canvas-node-container,
 .canvas-node-content {
+	content-visibility: auto;
 	contain: style;
+	width: 100%;
+	height: 100%;
+}
+
+.canvas-node-content.markdown-embed, 
+.canvas-node-content .obsidian-document {
+	overflow: visible !important;
+	overflow-y: visible !important;
 }
 
 .canvas-controls {

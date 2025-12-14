@@ -414,7 +414,6 @@ export namespace _MarkdownRendererInternal {
 			preview.show();
 
 		if (!preview.rerender || options.useFallbackRenderer) {
-			console.log(`Rendering ${preview.file.name} using fallback method`);
 			return renderMarkdownViewFallback(preview, options);
 		}
 
@@ -478,7 +477,6 @@ export namespace _MarkdownRendererInternal {
 		let rendered = false;
 		// @ts-ignore
 		preview.renderer.onRendered(() => {
-			console.log("Rendered");
 			rendered = true;
 		});
 
@@ -522,7 +520,6 @@ export namespace _MarkdownRendererInternal {
 		ExportLog.log("Waiting for all sections to be counted...");
 		var sectionsSuccess = await waitUntil(
 			() => {
-				console.log(sizerEl.children.length, sections.length);
 				return (
 					sizerEl.children.length >= sections.length ||
 					checkCancelled()
@@ -534,12 +531,6 @@ export namespace _MarkdownRendererInternal {
 		if (checkCancelled()) return undefined;
 
 		if (!sectionsSuccess) {
-			console.log(
-				sizerEl.children.length,
-				sections.length,
-				sizerEl.children,
-				sections
-			);
 			ExportLog.warning(
 				"Failed to render all sections in file " +
 					preview.file.name +
@@ -630,14 +621,12 @@ export namespace _MarkdownRendererInternal {
 		for (const canvas of canvases) {
 			// wait until the canvas is rendered
 			ExportLog.log("Waiting for canvas-based plugin to render...");
-			let canvasSuccess = await waitUntil(
-				() => canvas.toDataURL().length > 100 || checkCancelled(),
-				1000,
-				16
-			);
+			let data = "";
+			let canvasSuccess = await waitUntil(() => {
+				data = canvas.toDataURL();
+				return data.length > 100 || checkCancelled();
+			}, 1000, 16);
 			if (!canvasSuccess) continue;
-
-			const data = canvas.toDataURL();
 
 			const image = batchDocument.body.createEl("img");
 			image.src = data;
@@ -742,7 +731,7 @@ export namespace _MarkdownRendererInternal {
 	}
 
 	async function renderGeneric(view: View, options: MarkdownRendererOptions): Promise<HTMLElement | undefined> {
-		await delay(2000);
+		await delay(500); // Reduced from 2000ms
 
 		if (checkCancelled()) return undefined;
 
@@ -944,6 +933,13 @@ export namespace _MarkdownRendererInternal {
 		(header ?? sizerElement)?.prepend(titleEl);
 	}
 
+	/** Canvas export state interface - shared contract with frontend (fix #20B) */
+	export interface CanvasExportData {
+		originalBounds: { minX: number; minY: number; maxX: number; maxY: number };
+		viewportWidth: number;
+		viewportHeight: number;
+	}
+
 	export async function renderCanvas(view: any, options: MarkdownRendererOptions): Promise<HTMLElement | undefined> {
 		if (checkCancelled()) return undefined;
 
@@ -954,6 +950,20 @@ export namespace _MarkdownRendererInternal {
 
 		const nodes = canvas.nodes;
 		const edges = canvas.edges;
+
+		// Fix #2B: Capture original bounds BEFORE any transforms
+		let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+		for (const pair of nodes) {
+			const node = pair[1];
+			const x = node.x ?? 0;
+			const y = node.y ?? 0;
+			const w = node.width ?? 0;
+			const h = node.height ?? 0;
+			minX = Math.min(minX, x);
+			minY = Math.min(minY, y);
+			maxX = Math.max(maxX, x + w);
+			maxY = Math.max(maxY, y + h);
+		}
 
 		canvas.zoomToFit();
 		await delay(500);
@@ -974,7 +984,6 @@ export namespace _MarkdownRendererInternal {
 
 		if (!canvasEl)
 		{
-			console.log(contentEl.innerHTML);
 			return failRender(view.file, "Failed to render canvas! Canvas element not found!");	
 		}
 
@@ -996,7 +1005,6 @@ export namespace _MarkdownRendererInternal {
 				embedEl.innerHTML = "";
 
 				if ((options.inlineHTML || !allExportedPaths.contains(nodeFile.path)) && childPreview) {
-					console.log("Inlining child preview", nodeFile.path);
 					if (childPreview.owner) {
 						childPreview.owner.file =
 							childPreview.file ??
@@ -1041,9 +1049,38 @@ export namespace _MarkdownRendererInternal {
 
 		if (checkCancelled()) return undefined;
 
+		// Export DATA only, not BEHAVIOR. Runtime JS owns transforms/sizing.
+		// This prevents conflicts between export inline styles and runtime styling.
 		for (const pair of nodes) {
 			const node = pair[1];
-			const nodeEl = node.nodeEl;
+			const nodeEl = node.nodeEl as HTMLElement;
+			const x = node.x ?? 0;
+			const y = node.y ?? 0;
+			const w = node.width ?? 0;
+			const h = node.height ?? 0;
+			
+			// Data attributes - JS reads these to apply geometry at runtime
+			nodeEl.setAttribute('data-x', x.toString());
+			nodeEl.setAttribute('data-y', y.toString());
+			nodeEl.setAttribute('data-width', w.toString());
+			nodeEl.setAttribute('data-height', h.toString());
+			
+			// CSS custom properties for flexible styling (non-behavioral)
+			nodeEl.style.setProperty('--node-x', `${x}px`);
+			nodeEl.style.setProperty('--node-y', `${y}px`);
+			nodeEl.style.setProperty('--node-w', `${w}px`);
+			nodeEl.style.setProperty('--node-h', `${h}px`);
+			
+			// Clear ALL inline positioning - JS will apply from data attrs
+			// This avoids export/runtime style conflicts
+			nodeEl.style.transform = '';
+			nodeEl.style.width = '';
+			nodeEl.style.height = '';
+			nodeEl.style.left = '';
+			nodeEl.style.top = '';
+			(nodeEl.style as any).translate = '';
+			(nodeEl.style as any).scale = '';
+			(nodeEl.style as any).rotate = '';
 			canvasEl.appendChild(nodeEl);
 		}
 
@@ -1056,6 +1093,24 @@ export namespace _MarkdownRendererInternal {
 		}
 
 		newContentEl?.querySelector(".mod-zoomed-out")?.classList?.remove("mod-zoomed-out");
+
+		// Export raw bounds as data attributes; clear ALL transform properties
+		const clonedCanvas = newContentEl.querySelector('.canvas') as HTMLElement;
+		if (clonedCanvas) {
+			// Store original bounds for frontend to use
+			clonedCanvas.setAttribute('data-bounds-min-x', minX.toString());
+			clonedCanvas.setAttribute('data-bounds-min-y', minY.toString());
+			clonedCanvas.setAttribute('data-bounds-max-x', maxX.toString());
+			clonedCanvas.setAttribute('data-bounds-max-y', maxY.toString());
+			
+			// Clear ALL transform properties - runtime JS owns these
+			clonedCanvas.style.transform = '';
+			(clonedCanvas.style as any).translate = '';
+			(clonedCanvas.style as any).scale = '';
+			(clonedCanvas.style as any).rotate = '';
+		}
+
+		// Node data attributes were set before cloning, so they're already on cloned nodes
 
 		options.container?.appendChild(newContentEl);
 
@@ -1411,12 +1466,12 @@ export namespace _MarkdownRendererInternal {
 	}
 
 	export async function _setFileList(items: string[], options: { icons?: string[] | string, renderAsMarkdown?: boolean, title?: string }) {
-		const contaienr = loadingContainer?.querySelector(".html-progress-content") as HTMLElement;
-		if (!contaienr) return;
+		const container = loadingContainer?.querySelector(".html-progress-content") as HTMLElement;
+		if (!container) return;
 
 		const fileList = new SimpleFileListGenerator(items, options);
-		const fileListEl = await fileList.generate(contaienr);
-		contaienr.prepend(fileListEl);
+		const fileListEl = await fileList.generate(container);
+		container.prepend(fileListEl);
 		if (fileListContainer) fileListContainer.remove();
 		fileListContainer = fileListEl;
 	}
