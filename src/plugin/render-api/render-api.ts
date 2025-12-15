@@ -11,6 +11,7 @@ import { AssetLoader } from "../asset-loaders/base-asset";
 import { AssetType } from "../asset-loaders/asset-types";
 import { IconHandler } from "../utils/icon-handler";
 import { AssetHandler } from "../asset-loaders/asset-handler";
+import { CANVAS_DATA_ATTRS } from "../../shared/canvas-types";
 
 export namespace MarkdownRendererAPI {
 	export const viewableMediaExtensions = ["png", "jpg", "jpeg", "svg", "gif", "bmp", "ico", "mp4", "mov", "avi", "webm", "mpeg", "mp3", "wav", "ogg", "aac", "pdf", "html", "htm", "json", "txt", "yaml"];
@@ -933,12 +934,6 @@ export namespace _MarkdownRendererInternal {
 		(header ?? sizerElement)?.prepend(titleEl);
 	}
 
-	/** Canvas export state interface - shared contract with frontend (fix #20B) */
-	export interface CanvasExportData {
-		originalBounds: { minX: number; minY: number; maxX: number; maxY: number };
-		viewportWidth: number;
-		viewportHeight: number;
-	}
 
 	export async function renderCanvas(view: any, options: MarkdownRendererOptions): Promise<HTMLElement | undefined> {
 		if (checkCancelled()) return undefined;
@@ -1050,7 +1045,6 @@ export namespace _MarkdownRendererInternal {
 		if (checkCancelled()) return undefined;
 
 		// Export DATA only, not BEHAVIOR. Runtime JS owns transforms/sizing.
-		// This prevents conflicts between export inline styles and runtime styling.
 		for (const pair of nodes) {
 			const node = pair[1];
 			const nodeEl = node.nodeEl as HTMLElement;
@@ -1060,19 +1054,13 @@ export namespace _MarkdownRendererInternal {
 			const h = node.height ?? 0;
 			
 			// Data attributes - JS reads these to apply geometry at runtime
-			nodeEl.setAttribute('data-x', x.toString());
-			nodeEl.setAttribute('data-y', y.toString());
-			nodeEl.setAttribute('data-width', w.toString());
-			nodeEl.setAttribute('data-height', h.toString());
-			
-			// CSS custom properties for flexible styling (non-behavioral)
-			nodeEl.style.setProperty('--node-x', `${x}px`);
-			nodeEl.style.setProperty('--node-y', `${y}px`);
-			nodeEl.style.setProperty('--node-w', `${w}px`);
-			nodeEl.style.setProperty('--node-h', `${h}px`);
+			// Using shared constants for attribute names
+			nodeEl.setAttribute(CANVAS_DATA_ATTRS.NODE_X, x.toString());
+			nodeEl.setAttribute(CANVAS_DATA_ATTRS.NODE_Y, y.toString());
+			nodeEl.setAttribute(CANVAS_DATA_ATTRS.NODE_WIDTH, w.toString());
+			nodeEl.setAttribute(CANVAS_DATA_ATTRS.NODE_HEIGHT, h.toString());
 			
 			// Clear ALL inline positioning - JS will apply from data attrs
-			// This avoids export/runtime style conflicts
 			nodeEl.style.transform = '';
 			nodeEl.style.width = '';
 			nodeEl.style.height = '';
@@ -1094,14 +1082,17 @@ export namespace _MarkdownRendererInternal {
 
 		newContentEl?.querySelector(".mod-zoomed-out")?.classList?.remove("mod-zoomed-out");
 
-		// Export raw bounds as data attributes; clear ALL transform properties
+		// Export pre-computed bounds as data attributes using shared constants
 		const clonedCanvas = newContentEl.querySelector('.canvas') as HTMLElement;
 		if (clonedCanvas) {
-			// Store original bounds for frontend to use
-			clonedCanvas.setAttribute('data-bounds-min-x', minX.toString());
-			clonedCanvas.setAttribute('data-bounds-min-y', minY.toString());
-			clonedCanvas.setAttribute('data-bounds-max-x', maxX.toString());
-			clonedCanvas.setAttribute('data-bounds-max-y', maxY.toString());
+			// Store bounds for frontend - pre-compute width/height to avoid runtime math
+			clonedCanvas.setAttribute(CANVAS_DATA_ATTRS.BOUNDS_MIN_X, minX.toString());
+			clonedCanvas.setAttribute(CANVAS_DATA_ATTRS.BOUNDS_MIN_Y, minY.toString());
+			clonedCanvas.setAttribute(CANVAS_DATA_ATTRS.BOUNDS_WIDTH, (maxX - minX).toString());
+			clonedCanvas.setAttribute(CANVAS_DATA_ATTRS.BOUNDS_HEIGHT, (maxY - minY).toString());
+			// Keep max for legacy compatibility
+			clonedCanvas.setAttribute(CANVAS_DATA_ATTRS.BOUNDS_MAX_X, maxX.toString());
+			clonedCanvas.setAttribute(CANVAS_DATA_ATTRS.BOUNDS_MAX_Y, maxY.toString());
 			
 			// Clear ALL transform properties - runtime JS owns these
 			clonedCanvas.style.transform = '';
@@ -1174,6 +1165,8 @@ export namespace _MarkdownRendererInternal {
 		});
 
 		// add href to embed links
+		// Note: remapLinks() in webpage.ts only processes ".obsidian-document [href]"
+		// Canvas embeds may not be inside .obsidian-document, so we must handle .md->.html here
 		html.querySelectorAll(".markdown-embed-link").forEach((linkDiv: HTMLElement) => {
 			const embedParent = linkDiv.closest(".internal-embed");
 			const src = embedParent?.getAttribute("src");
@@ -1181,7 +1174,12 @@ export namespace _MarkdownRendererInternal {
 				const anchor = batchDocument.body.createEl("a");
 				anchor.className = linkDiv.className;
 				anchor.innerHTML = linkDiv.innerHTML;
-				anchor.setAttribute("href", src);
+				// Convert .md extension to .html for exported pages
+				// Split on # to preserve anchor, replace extension, rejoin
+				const [pathPart, ...anchorParts] = src.split('#');
+				const htmlPath = pathPart.replace(/\.md$/, '.html');
+				const href = anchorParts.length > 0 ? `${htmlPath}#${anchorParts.join('#')}` : htmlPath;
+				anchor.setAttribute("href", href);
 				linkDiv.replaceWith(anchor);
 			}
 		});

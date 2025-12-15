@@ -1,9 +1,30 @@
 import { WebpageDocument } from "./document"
-import { LinkHandler } from "./links";
-import { Bounds, inOutQuadBlend, Vector2, getPointerPosition, lerp, lerpv, inOutQuadBlendv, lerpc, clamp, mapRange, mapRangeClamped } from "./utils";
+import { Bounds, Vector2 } from "./utils";
+import { parseCanvasBounds, parseNodeGeometry, type CanvasNodeGeometry } from "../../shared/canvas-types";
 
-export enum NodeType
-{
+// ═══════════════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+const SCALE_MULTIPLIER_DEFAULT = 0.9;
+const SMALL_SCALE_THRESHOLD = 0.15;
+const WHEEL_SCALE_DIVISOR = 500;
+const INTERACTION_IDLE_MS = 120;
+const ANIMATION_DURATION_MS = 300;
+
+/** Small-scale approach: 'class' for binary toggle, 'cssvar' for smooth interpolation */
+export type SmallScaleApproach = 'class' | 'cssvar';
+
+/** Configuration for A/B testing - can be set before Canvas construction */
+export const CanvasConfig = {
+	smallScaleApproach: 'class' as SmallScaleApproach,
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TYPES
+// ═══════════════════════════════════════════════════════════════════════════
+
+export enum NodeType {
 	Markdown = "markdown",
 	ExternalMarkdown = "external-markdown",
 	Canvas = "canvas",
@@ -15,8 +36,11 @@ export enum NodeType
 	None = "none"
 }
 
-export class CanvasNode
-{
+// ═══════════════════════════════════════════════════════════════════════════
+// CANVAS NODE
+// ═══════════════════════════════════════════════════════════════════════════
+
+export class CanvasNode {
 	public canvas: Canvas;
 	public nodeEl: HTMLElement;
 	public labelEl: HTMLElement;
@@ -26,615 +50,546 @@ export class CanvasNode
 	public document: WebpageDocument;
 	public isFocused: boolean = false;
 
-	// Cached at construction - nodes don't move during zoom/pan
-	private _localPosition: Vector2;
-	private _localSize: Vector2;
+	private readonly _geometry: CanvasNodeGeometry;
 
-	public get size(): Vector2 { return this._localSize; }
+	public get localPosition(): Vector2 { return new Vector2(this._geometry.x, this._geometry.y); }
+	public get localSize(): Vector2 { return new Vector2(this._geometry.width, this._geometry.height); }
 
-	public set size(newSize: Vector2)
-	{
-		this._localSize = newSize;
-		this.nodeEl.style.width = newSize.x + "px";
-		this.nodeEl.style.height = newSize.y + "px";
-		this.nodeEl.style.setProperty("--canvas-node-width", newSize.x + "px");
-		this.nodeEl.style.setProperty("--canvas-node-height", newSize.y + "px");
-	}
-
-	public get position(): Vector2 { return this._localPosition; }
-
-	public set position(newPos: Vector2)
-	{
-		this._localPosition = newPos;
-		this.nodeEl.style.transform = `translate(${newPos.x}px, ${newPos.y}px)`;
-	}
-
-	public get bounds(): Bounds
-	{
-		const scale = this.canvas.scale;
-		const pos = this.canvas.position;
-		return new Bounds(
-			this._localPosition.x * scale + pos.x,
-			this._localPosition.y * scale + pos.y,
-			this._localSize.x * scale,
-			this._localSize.y * scale
-		);
-	}
-
-	public get label(): string
-	{
+	public get label(): string {
 		return this.labelEl?.textContent ?? "";
 	}
 
-	public set label(newLabel: string)
-	{
+	public set label(newLabel: string) {
 		if (this.labelEl) this.labelEl.textContent = newLabel;
 	}
 
-	public get isScrollable(): boolean
-	{
-		if (!this.document) return false;
-		return this.document?.documentEl.scrollHeight > this.document?.documentEl.clientHeight;
+	/** Get local bounds for this node (immutable after construction) */
+	public get localBounds(): Bounds {
+		return new Bounds(
+			this._geometry.x,
+			this._geometry.y,
+			this._geometry.width,
+			this._geometry.height
+		);
 	}
 
-	public get scrollContainer(): HTMLElement | null
-	{
-		return this.document?.documentEl;
+	/** Compute screen bounds on-demand (depends on current canvas transform) */
+	public getScreenBounds(canvasScale: number, canvasPosition: Vector2): Bounds {
+		return new Bounds(
+			this._geometry.x * canvasScale + canvasPosition.x,
+			this._geometry.y * canvasScale + canvasPosition.y,
+			this._geometry.width * canvasScale,
+			this._geometry.height * canvasScale
+		);
 	}
 
-	constructor(canvas: Canvas, nodeEl: HTMLElement)
-	{
+	constructor(canvas: Canvas, nodeEl: HTMLElement) {
 		this.canvas = canvas;
 		this.nodeEl = nodeEl;
-		//@ts-ignore
-		this.nodeEl.nodeObj = this;
 		this.labelEl = nodeEl.querySelector(".canvas-node-label") as HTMLElement;
 		this.containerEl = nodeEl.querySelector(".canvas-node-container") as HTMLElement;
 		this.contentEl = nodeEl.querySelector(".canvas-node-content") as HTMLElement;
 
-		// Parse position/size once from CSS (they don't change during zoom/pan)
-		this._localSize = new Vector2(
-			parseFloat(nodeEl.style.width.replace("px", "")) || 0,
-			parseFloat(nodeEl.style.height.replace("px", "")) || 0
-		);
-		this._localPosition = this.parsePositionFromCSS();
+		// Read geometry from structured data attributes
+		this._geometry = parseNodeGeometry(nodeEl);
 
-		if (!this.containerEl || !this.contentEl)
-		{
+		// Apply geometry - runtime owns transform/sizing
+		nodeEl.style.transform = `translate3d(${this._geometry.x}px, ${this._geometry.y}px, 0)`;
+		nodeEl.style.width = `${this._geometry.width}px`;
+		nodeEl.style.height = `${this._geometry.height}px`;
+
+		if (!this.containerEl || !this.contentEl) {
 			console.error("Failed to find all required elements for canvas node", this);
 			return;
 		}
 
-		const contentClasses = this.contentEl.classList;
-		if (contentClasses.contains("image-embed")) this.type = NodeType.Image;
-		else if (contentClasses.contains("video-embed")) this.type = NodeType.Video;
-		else if (contentClasses.contains("audio-embed")) this.type = NodeType.Audio;
-		else if (contentClasses.contains("markdown-embed") && contentClasses.contains("external-markdown-embed")) this.type = NodeType.ExternalMarkdown;
-		else if (contentClasses.contains("markdown-embed")) this.type = NodeType.Markdown;
-		else if (contentClasses.contains("canvas-embed")) this.type = NodeType.Canvas;
-		else if (this.contentEl.firstElementChild?.tagName === "IFRAME") this.type = NodeType.Website;
-		else if (this.nodeEl.classList.contains("canvas-node-group")) this.type = NodeType.Group;
-		else this.type = NodeType.None;
+		this.type = this.detectNodeType();
 
-		if (this.type == NodeType.ExternalMarkdown)
-		{
+		if (this.type === NodeType.ExternalMarkdown) {
 			const documentEl = this.contentEl.querySelector(".obsidian-document");
-			console.log(documentEl);
-			const documentObj = canvas.document.children.find((doc) => doc.documentEl == documentEl);
+			const documentObj = canvas.document.children.find((doc) => doc.documentEl === documentEl);
 			if (documentObj) this.document = documentObj;
 			else console.error("Failed to find document object for external markdown node", this);
 		}
 
-		// if (this.type == NodeType.Group)
-		// {
-		// 	this.nodeEl.style.pointerEvents = "auto";
-		// }
-
 		this.initEvents();
 	}
 
-	private parsePositionFromCSS(): Vector2
-	{
-		const transform = this.nodeEl.style.transform;
-		const match = transform.match(/translate\(([^,]+)px, ([^,]+)px\)/);
-		const translate = this.nodeEl.style.translate;
-		const match2 = translate.match(/([^,]+)px ([^,]+)px/);
-
-		let x = 0, y = 0;
-		if (match) { x += parseFloat(match[1]); y += parseFloat(match[2]); }
-		if (match2) { x += parseFloat(match2[1]); y += parseFloat(match2[2]); }
-		return new Vector2(x, y);
+	private detectNodeType(): NodeType {
+		const contentClasses = this.contentEl.classList;
+		if (contentClasses.contains("image-embed")) return NodeType.Image;
+		if (contentClasses.contains("video-embed")) return NodeType.Video;
+		if (contentClasses.contains("audio-embed")) return NodeType.Audio;
+		if (contentClasses.contains("markdown-embed") && contentClasses.contains("external-markdown-embed")) return NodeType.ExternalMarkdown;
+		if (contentClasses.contains("markdown-embed")) return NodeType.Markdown;
+		if (contentClasses.contains("canvas-embed")) return NodeType.Canvas;
+		if (this.contentEl.firstElementChild?.tagName === "IFRAME") return NodeType.Website;
+		if (this.nodeEl.classList.contains("canvas-node-group")) return NodeType.Group;
+		return NodeType.None;
 	}
 
-	public focus(force: boolean = true)
-	{
-		if (this.isFocused && force) return;
-		if (this.canvas.focusedNode != this) this.canvas.focusedNode?.focus(false);
+	public focus(force: boolean = true): void {
+		if (this.isFocused === force) return;
+		if (this.canvas.focusedNode !== this) this.canvas.focusedNode?.focus(false);
 		this.nodeEl.classList.toggle("is-focused", force);
 		this.canvas.focusedNode = force ? this : null;
 		this.isFocused = force;
 	}
 
-	private initEvents()
-	{
-		const node = this;
+	private handlePointerLeave = (): void => {
+		this.focus(false);
+	};
 
-		this.nodeEl.addEventListener("dblclick", (e) => 
-		{
-			node.fitToView(false);
-		});
+	private initEvents(): void {
+		this.nodeEl.addEventListener("dblclick", () => this.fitToView());
 
-		function onEnter(event: PointerEvent)
-		{
-			node.focus(true);
-			node.nodeEl.addEventListener("mouseleave", onLeave);
-			node.nodeEl.addEventListener("touchend", onLeave);
+		this.nodeEl.addEventListener("pointerenter", (event: PointerEvent) => {
+			this.focus(true);
+			this.nodeEl.addEventListener("pointerleave", this.handlePointerLeave, { once: true });
 			event.stopPropagation();
-		}
-
-		function onLeave()
-		{
-			console.log("leave");
-			node.focus(false);
-			node.nodeEl.removeEventListener("mouseleave", onLeave);
-			node.nodeEl.removeEventListener("touchend", onLeave);
-		}
-
-		this.nodeEl.addEventListener("pointerenter", onEnter);
+		});
 	}
 
-	public fitToView(instant: boolean = false)
-	{
-		this.canvas.fitToBounds(this.bounds, 0.9, instant);
+	public fitToView(): void {
+		this.canvas.animateToView(this.localBounds, SCALE_MULTIPLIER_DEFAULT);
 	}
 }
 
-export class Canvas
-{
+// ═══════════════════════════════════════════════════════════════════════════
+// CANVAS
+// ═══════════════════════════════════════════════════════════════════════════
+
+export class Canvas {
 	public document: WebpageDocument;
 	public nodes: CanvasNode[];
 	public canvasEl: HTMLElement;
 	public wrapperEl: HTMLElement;
-	public backgroundEl: HTMLElement;
-	public backgroundDotEl: SVGCircleElement;
 	public focusedNode: CanvasNode | null = null;
 
-	// Cache to avoid redundant CSS updates
+	// Transform state - current is what's rendered, target is where we're animating to
+	private _position: Vector2 = new Vector2(0, 0);
+	private _scale: number = 1;
+	private _targetPosition: Vector2 = new Vector2(0, 0);
+	private _targetScale: number = 1;
+
+	// Cached local bounds - computed once, never changes
+	private _cachedLocalBounds: Bounds | null = null;
+
+	// Wrapper rect caching
+	private _wrapperRect: DOMRect | null = null;
+	private _wrapperRectDirty: boolean = true;
+	private _resizeObserver: ResizeObserver | null = null;
+	private readonly _handleRectDirty = () => { this._wrapperRectDirty = true; };
+
+	// Interaction state
+	private _isInteracting: boolean = false;
+	private _interactionIdleTimeoutId: number | null = null;
+
+	// Animation state - Web Animations API
+	private _currentAnimation: Animation | null = null;
+
+	// Scale class caching
 	private _lastSmallScale: boolean = false;
 
-	// Cache wrapper rect to avoid getBoundingClientRect() in hot path
-	private _wrapperRect: DOMRect | null = null;
-	private _updateWrapperRect = () => { 
-		this._wrapperRect = this.wrapperEl.getBoundingClientRect(); 
-	};
-
-	// Animation state - RAF loop only runs when animating
-	private _isAnimating: boolean = false;
-	private readonly _tick = (t: number) => this.updateScale(t);
-
-	/** Starts animation loop if not already running */
-	private startAnimation(): void {
-		if (!this._isAnimating) {
-			this._isAnimating = true;
-			this.lastTime = 0;
-			requestAnimationFrame(this._tick);
-		}
-	}
-
-	private _renderScale = 1;
-	public get renderScale(): number { return this._renderScale; }
-	public set renderScale(scale: number)
-	{
-		this._renderScale = scale;
-		// renderScale now just triggers a transform update
-		this.applyTransform();
-	}
-
-
-	public get nodeBounds(): Bounds
-	{
-		performance.mark('nodeBounds-start');
-		if (this.nodes.length == 0) {
-			performance.mark('nodeBounds-end');
-			return new Bounds(0, 0, 0, 0);
-		}
-		const bounds = this.nodes[0].bounds;
-
-		for (const node of this.nodes)
-		{
-			bounds.encapsulate(node.bounds);
-		};
-
-		performance.mark('nodeBounds-end');
-		return bounds;
-	}
-
-	public get wrapperBounds(): Bounds
-	{
-		return Bounds.fromElement(this.wrapperEl);
-	}
-
+	// Scale limits
 	private readonly _minScale: number = 0.1;
 	private readonly _maxScale: number = 5;
 	public get minScale(): number { return this._minScale; }
 	public get maxScale(): number { return this._maxScale; }
 
-	private _targetScale: number = 1;
-	public get targetScale(): number { return this._targetScale}
-	private set targetScale(newScale: number) 
-	{
-		newScale = Math.min(Math.max(newScale, this.minScale), this.maxScale);
-		this._targetScale = newScale;
-		this.startAnimation();
-	}
-	
-	private _scale: number = 1;
+	// Public accessors
 	public get scale(): number { return this._scale; }
-	private set scale(newScale: number)
-	{
-		const ratio = newScale / this._scale;
-		this._scale = newScale;
-		
-		const isSmallScale = newScale < 0.15;
-		if (this._lastSmallScale !== isSmallScale) {
-			this._lastSmallScale = isSmallScale;
-			this.canvasEl.classList.toggle("small-scale", isSmallScale);
-		}
-		
-		// Note: applyTransform() is called in updateScale() to batch updates
-		this.backgroundScale = this.backgroundScale * ratio;
-	}
+	public get canvasPosition(): Vector2 { return this._position; }
 
-	// private nodespaceOffset: Vector2;
-	private _targetPosition: Vector2 = new Vector2(0, 0);
-	public get targetPosition(): Vector2 { return this._targetPosition; }
-	public set targetPosition(screenPos: Vector2)
-	{
-		this._targetPosition = screenPos;
-		this.startAnimation();
-	}
-
-	private _position: Vector2 = new Vector2(0, 0);
-	public get position(): Vector2 { return this._position; }
-	public set position(screenPos: Vector2)
-	{
-		this._position = screenPos;
-		// Note: applyTransform() is called in updateScale() to batch updates
-		this.backgroundPosition = screenPos;
-	}
-
-	/** Applies position and scale as a single CSS transform */
-	private applyTransform(): void
-	{
-		if (!this.canvasEl) return;
-		const x = this._position.x / this._renderScale;
-		const y = this._position.y / this._renderScale;
-		const s = this._scale / this._renderScale;
-		this.canvasEl.style.transform = `translate(${x}px, ${y}px) scale(${s})`;
-	}
-
-	public set forcePosition(screenPos: Vector2)
-	{
-		this.targetPosition = screenPos;
-		this.position = screenPos;
-	}
-
-	public get forcePosition(): Vector2
-	{
-		return this.position;
-	}
-
-	private _backgroundBaseScale: number = 20;
-	private _invisibleBackgroundScale: number = 2;
-	private _backgroundScale: number = this._backgroundBaseScale;
-	public get backgroundScale(): number { return this._backgroundScale; }
-	public set backgroundScale(newScale: number)
-	{
-		this._backgroundScale = newScale;
-		this.applyBackgroundTransform();
-	}
-
-	private _backgroundDotSize: number = 1;
-	public get backgroundDotSize(): number { return this._backgroundDotSize; }
-	public set backgroundDotSize(newSize: number)
-	{
-		const sizeStr = newSize.toString() ?? "0.7";
-		this.backgroundDotEl?.setAttribute("r", sizeStr);
-		this.backgroundDotEl?.setAttribute("cx", sizeStr);
-		this.backgroundDotEl?.setAttribute("cy", sizeStr);
-		this._backgroundDotSize = newSize;
-	}
-
-	private _backgroundPosition: Vector2 = new Vector2(0, 0);
-	public get backgroundPosition(): Vector2 { return this._backgroundPosition; }
-	public set backgroundPosition(newPosition: Vector2)
-	{
-		this._backgroundPosition = newPosition;
-		this.applyBackgroundTransform();
-	}
-
-	/** Batch background updates into single transform + opacity write */
-	private applyBackgroundTransform(): void {
-		const parent = this.backgroundEl?.parentElement;
-		if (!parent) return;
-		const s = this._backgroundScale / this._backgroundBaseScale;
-		const x = this._backgroundPosition.x;
-		const y = this._backgroundPosition.y;
-		const opacity = 1 - mapRangeClamped(this._backgroundScale, this._backgroundBaseScale / 2, this._invisibleBackgroundScale, 0, 1);
-		parent.style.transform = `translate(${x}px, ${y}px) scale(${s})`;
-		parent.style.opacity = opacity.toString();
-	}
-
-
-	constructor(document: WebpageDocument)
-	{
+	constructor(document: WebpageDocument) {
 		this.document = document;
+
+		// Setup wrapper with CSS classes (hidden until ready)
+		const wrapperEl = document.documentEl.querySelector(".canvas-wrapper") as HTMLElement;
+		wrapperEl.classList.add('canvas-export-mode');
+
 		this.nodes = Array.from(document.documentEl.querySelectorAll(".canvas-node"))
-					.map((nodeEl) => new CanvasNode(this, nodeEl as HTMLElement));
+			.map((nodeEl) => new CanvasNode(this, nodeEl as HTMLElement));
 
-		// canvas nodes sometimes (not always) have both a translate and a transform: translate in their style
-		// this snippets combines them into one just one translation
-		
-
-		// make local space equal to screen space
-		this.document.documentEl.style.position = "absolute";
-		this.document.documentEl.style.width = "100%";
-		this.document.documentEl.style.height = "100%";
-		this.document.documentEl.style.overflow = "hidden";
-		this.document.documentEl.style.top = "0";
-		this.document.documentEl.style.left = "0";
+		// Apply document class for canvas-specific layout
+		this.document.documentEl.classList.add('canvas-document');
 
 		this.canvasEl = document.documentEl.querySelector(".canvas") as HTMLElement;
-		this.wrapperEl = document.documentEl.querySelector(".canvas-wrapper") as HTMLElement;
-		this.backgroundEl = document.documentEl.querySelector(".canvas-background pattern") as HTMLElement;
-		this.backgroundDotEl = this.backgroundEl?.querySelector("circle") as SVGCircleElement;
-		// Use transform-origin 0 0 for predictable scaling from top-left
-		this.canvasEl.style.transformOrigin = "0 0";
-		this.backgroundScale = this._backgroundScale;
-		this.backgroundDotSize = this._backgroundDotSize;
-		this.renderScale = this._renderScale;
+		this.wrapperEl = wrapperEl;
 
-		// Cache wrapper rect and update on resize/scroll (avoids getBoundingClientRect in hot path)
-		this._updateWrapperRect();
-		new ResizeObserver(this._updateWrapperRect).observe(this.wrapperEl);
-		window.addEventListener("scroll", this._updateWrapperRect, true);
+		// Enable appropriate small-scale approach
+		if (CanvasConfig.smallScaleApproach === 'cssvar') {
+			this.canvasEl.classList.add('small-scale-var');
+		}
 
-		const nodespaceOffset = Bounds.fromElement(this.canvasEl).min.sub(this.nodeBounds.min);
-		Array.from(this.canvasEl.children).forEach((el) => 
-		{
-			//@ts-ignore
-			el.style.translate = `${nodespaceOffset.x}px ${nodespaceOffset.y}px`;
-		});
+		// Read and cache bounds from export data
+		this.initBoundsFromExport();
 
-		this.forcePosition = this.nodeBounds.min.sub(this.wrapperBounds.min);
-		
+		// Setup wrapper rect caching
+		this.refreshWrapperRect();
+		this._resizeObserver = new ResizeObserver(this._handleRectDirty);
+		this._resizeObserver.observe(this.wrapperEl);
+		window.addEventListener("scroll", this._handleRectDirty, { capture: true, passive: true });
+
 		this.initEvents();
 
-		this.wrapperEl.style.transition = "opacity 0.0s";
-		this.wrapperEl.classList.add("hide");
-		this.wrapperEl.style.transition = "opacity 3s";
-		this.wrapperEl.classList.remove("hide");
+		// Initial fit
+		this.fitToView(this.getLocalBounds(), SCALE_MULTIPLIER_DEFAULT);
 
-		this.fitToBounds(this.nodeBounds, 3, true);
-
-		setTimeout(() =>
-		{
-			// zoom in animation
-			this.fitToBounds(this.nodeBounds, 0.9, false);
-		}, 100);
+		// Reveal after geometry applied
+		requestAnimationFrame(() => {
+			this.wrapperEl.classList.add('canvas-ready');
+		});
 	}
 
-	private lastTime: number = 0;
-	private updateScale(time: number)
-	{
-		if (this.lastTime == 0) this.lastTime = time;
-		const deltaTime = (time - this.lastTime) / 1000;
-		this.lastTime = time;
+	private initBoundsFromExport(): void {
+		const bounds = parseCanvasBounds(this.canvasEl);
+		if (bounds) {
+			this._cachedLocalBounds = new Bounds(
+				bounds.minX,
+				bounds.minY,
+				bounds.width,
+				bounds.height
+			);
+		}
+	}
 
-		if (Math.abs(this.targetScale - this.scale) > 0.0001) 
-			this.scale = inOutQuadBlend(this.scale, this.targetScale, 6 * deltaTime);
+	/** Get cached local bounds (computed once) */
+	public getLocalBounds(): Bounds {
+		if (this._cachedLocalBounds) {
+			return this._cachedLocalBounds;
+		}
 
-		if (this.targetPosition.sub(this.position).magnitude > 0.001)
-			this.position = inOutQuadBlendv(this.position, this.targetPosition, 6 * deltaTime);
+		// Compute from nodes if not cached
+		if (this.nodes.length === 0) {
+			return new Bounds(0, 0, 0, 0);
+		}
 
-		// Single CSS transform update per frame (batches scale + position)
-		this.applyTransform();
+		const first = this.nodes[0];
+		const bounds = new Bounds(
+			first.localPosition.x,
+			first.localPosition.y,
+			first.localSize.x,
+			first.localSize.y
+		);
 
-		// Only continue RAF if still animating toward target
-		const scaleMoving = Math.abs(this.targetScale - this.scale) > 0.0001;
-		const posMoving = this.targetPosition.sub(this.position).magnitude > 0.001;
-		if (scaleMoving || posMoving) {
-			requestAnimationFrame(this._tick);
+		for (let i = 1; i < this.nodes.length; i++) {
+			bounds.encapsulate(this.nodes[i].localBounds);
+		}
+
+		this._cachedLocalBounds = bounds;
+		return bounds;
+	}
+
+	/** Compute screen bounds on-demand */
+	public getScreenBounds(): Bounds {
+		if (this.nodes.length === 0) {
+			return new Bounds(0, 0, 0, 0);
+		}
+
+		const first = this.nodes[0].getScreenBounds(this._scale, this._position);
+		const bounds = new Bounds(first.left, first.top, first.width, first.height);
+
+		for (let i = 1; i < this.nodes.length; i++) {
+			const nodeBounds = this.nodes[i].getScreenBounds(this._scale, this._position);
+			bounds.encapsulate(nodeBounds);
+		}
+
+		return bounds;
+	}
+
+	private refreshWrapperRect(): void {
+		if (this._wrapperRectDirty || !this._wrapperRect) {
+			this._wrapperRect = this.wrapperEl.getBoundingClientRect();
+			this._wrapperRectDirty = false;
+		}
+	}
+
+	private setInteracting(value: boolean): void {
+		if (this._isInteracting === value) return;
+		this._isInteracting = value;
+		this.canvasEl.classList.toggle('is-interacting', value);
+	}
+
+	private bumpInteraction(): void {
+		this.setInteracting(true);
+		if (this._interactionIdleTimeoutId !== null) {
+			clearTimeout(this._interactionIdleTimeoutId);
+		}
+		this._interactionIdleTimeoutId = window.setTimeout(() => {
+			this.setInteracting(false);
+			this._interactionIdleTimeoutId = null;
+		}, INTERACTION_IDLE_MS);
+	}
+
+	private applyTransform(): void {
+		this.canvasEl.style.transform = `translate3d(${this._position.x}px, ${this._position.y}px, 0) scale(${this._scale})`;
+	}
+
+	private updateSmallScaleClass(): void {
+		if (CanvasConfig.smallScaleApproach === 'cssvar') {
+			// CSS var approach: smooth interpolation
+			const factor = Math.max(0, Math.min(1, (SMALL_SCALE_THRESHOLD - this._scale) / SMALL_SCALE_THRESHOLD));
+			this.canvasEl.style.setProperty('--small-scale-factor', factor.toString());
 		} else {
-			this._isAnimating = false;
+			// Class toggle approach: binary on/off
+			const isSmallScale = this._scale < SMALL_SCALE_THRESHOLD;
+			if (this._lastSmallScale !== isSmallScale) {
+				this._lastSmallScale = isSmallScale;
+				this.canvasEl.classList.toggle("small-scale", isSmallScale);
+			}
 		}
 	}
 
-	private initEvents()
-	{
-		// make canvas draggable / panable with mouse
-		const localThis = this;
-        const isWindows = navigator.userAgent.includes("Windows");
+	// ═══════════════════════════════════════════════════════════════════════
+	// ANIMATION SYSTEM (Web Animations API)
+	// ═══════════════════════════════════════════════════════════════════════
 
-		function getRelativePointerPosition(event: MouseEvent | Touch): Vector2 {
-            const rect = localThis._wrapperRect!;
-            const x = event.clientX - rect.left;
-            const y = event.clientY - rect.top;
-            return new Vector2(x, y);
-        }
-
-        function dragStart(event: PointerEvent) {
-            if (event.pointerType != "mouse" && event.pointerType != "pen") return;
-            const startPointerPos = getRelativePointerPosition(event);
-            const startCanvasPos = localThis.position;
-            const startingNode = localThis.focusedNode;
-            // Cache scroll state at drag start to avoid layout reads during drag
-            const startingNodeIsScrollable = !!startingNode?.isScrollable;
-
-            function drag(dragEvent: MouseEvent) {
-                if (isWindows && 
-                    startingNodeIsScrollable && 
-                    dragEvent.buttons == 4) return;
-
-                dragEvent.preventDefault();
-                const pointer = getRelativePointerPosition(dragEvent);
-                const delta = pointer.sub(startPointerPos);
-                localThis.forcePosition = startCanvasPos.add(delta);
-            }
-
-            function dragEnd(e: MouseEvent) {
-                document.removeEventListener("mousemove", drag);
-                document.removeEventListener("mouseup", dragEnd);
-            }
-
-            document.addEventListener("mousemove", drag);
-            document.addEventListener("mouseup", dragEnd);
-        }
-
-        this.wrapperEl.addEventListener("pointerdown", dragStart);
-
-		function shouldOverrideScroll(deltaY: number, deltaX: number, node: CanvasNode | null | undefined): boolean
-		{
-			const scrollContainer = node?.scrollContainer;
-			if (scrollContainer)
-			{
-				// if the container can be scrolled up and the user is scrolling up, don't zoom
-				if (scrollContainer.scrollTop != 0 && deltaY < 0 && Math.abs(deltaY / (deltaX+0.01)) > 2)
-					return false;
-			
-				// if the container can be scrolled down and the user is scrolling down, don't zoom
-				if ((scrollContainer.scrollHeight - scrollContainer.scrollTop) > (scrollContainer.clientHeight + 1) &&
-					deltaY > 0 && Math.abs(deltaY / (deltaX+0.01)) > 2)
-					return false;
-
-				// if the container can be scrolled left and the user is scrolling left, don't zoom
-				if (scrollContainer.scrollLeft != 0 && deltaX < 0 && Math.abs(deltaX / (deltaY+0.01)) > 2)
-					return false;
-
-				// if the container can be scrolled right and the user is scrolling right, don't zoom
-				if ((scrollContainer.scrollWidth - scrollContainer.scrollLeft) > (scrollContainer.clientWidth + 1) &&
-					deltaX > 0 && Math.abs(deltaX / (deltaY+0.01)) > 2)
-					return false;
-			}
-
-			return true;
+	/** Cancel any running animation */
+	private cancelAnimation(): void {
+		if (this._currentAnimation) {
+			this._currentAnimation.cancel();
+			this._currentAnimation = null;
 		}
+	}
 
-		// make canvas mouse zoomable
-		this.wrapperEl.addEventListener("wheel", function (event) {
-            if (!shouldOverrideScroll(event.deltaY, event.deltaX, localThis.focusedNode)) return;
-            let scale = 1;
-            scale -= event.deltaY / 700 * scale;
-            localThis.scaleAround(scale, getRelativePointerPosition(event));
-        }, { passive: true });
+	/** Animate to target position and scale using Web Animations API */
+	private animateToTarget(targetPos: Vector2, targetScale: number, duration: number = ANIMATION_DURATION_MS): void {
+		this.cancelAnimation();
 
-        let touching = false;
-        this.wrapperEl.addEventListener("touchstart", function (event) {
-            if (touching) return;
-            touching = true;
-            const touches = event.touches;
-            
-            function getTouchData(touches: TouchList) {
-                const touch1 = getRelativePointerPosition(touches[0]);
-                const touch2 = touches.length == 2 ? getRelativePointerPosition(touches[1]) : null;
-                const center = touch2 ? touch1.add(touch2).scale(0.5) : touch1;
-                const distance = touch2 ? Vector2.distance(touch1, touch2) : 0;
+		const startTransform = `translate3d(${this._position.x}px, ${this._position.y}px, 0) scale(${this._scale})`;
+		const endTransform = `translate3d(${targetPos.x}px, ${targetPos.y}px, 0) scale(${targetScale})`;
 
-                return { touch1, touch2, center, distance };
-            }
+		this._currentAnimation = this.canvasEl.animate(
+			[{ transform: startTransform }, { transform: endTransform }],
+			{
+				duration,
+				easing: 'cubic-bezier(0.4, 0, 0.2, 1)', // Material Design ease-out
+				fill: 'forwards',
+			}
+		);
 
-            let lastTouchData = getTouchData(touches);
-            let isTwoFingerDrag = touches.length == 2;
-            const startingNode = localThis.focusedNode;
-        
-            function touchMove(event: TouchEvent) {
-                const touches = event.touches;
-                const touchData = getTouchData(touches);
+		// Update state when animation completes
+		this._currentAnimation.finished
+			.then(() => {
+				this._position = targetPos;
+				this._targetPosition = targetPos;
+				this._scale = targetScale;
+				this._targetScale = targetScale;
+				this.updateSmallScaleClass();
+				this.applyTransform(); // Commit final transform to style
+				this._currentAnimation = null;
+			})
+			.catch(() => {
+				// Animation was cancelled - state already updated by interrupting code
+			});
+	}
 
-                if (touches.length == 2) {
-                    if (!isTwoFingerDrag) {
-                        lastTouchData = getTouchData(touches);
-                        isTwoFingerDrag = true;
-                    }
+	/** Set target position (animates smoothly via WAAPI) */
+	public setTargetPosition(pos: Vector2): void {
+		this._targetPosition = pos;
+		this.animateToTarget(pos, this._targetScale);
+	}
 
-                    const scaleDelta = (touchData.distance - lastTouchData.distance) / lastTouchData.distance;
-                    localThis.scaleAround(1 + scaleDelta, touchData.center);
-                }
+	/** Set target scale (animates smoothly via WAAPI) */
+	public setTargetScale(scale: number): void {
+		this._targetScale = Math.min(Math.max(scale, this._minScale), this._maxScale);
+		this.animateToTarget(this._targetPosition, this._targetScale);
+	}
 
-                const delta = touchData.center.sub(lastTouchData.center);
-                if (!isTwoFingerDrag && !shouldOverrideScroll(-delta.y, delta.x, startingNode)) {
-                    lastTouchData = getTouchData(touches);
-                    return;
-                }
+	/** Set position immediately (no animation) */
+	public setPositionImmediate(pos: Vector2): void {
+		this.cancelAnimation();
+		this._position = pos;
+		this._targetPosition = pos;
+		this.applyTransform();
+	}
 
-                event.preventDefault();
-                localThis.targetPosition = localThis.targetPosition.add(delta);
-                lastTouchData = getTouchData(touches);
-            }
+	/** Set scale immediately (no animation) */
+	public setScaleImmediate(scale: number): void {
+		this.cancelAnimation();
+		scale = Math.min(Math.max(scale, this._minScale), this._maxScale);
+		this._scale = scale;
+		this._targetScale = scale;
+		this.updateSmallScaleClass();
+		this.applyTransform();
+	}
 
-            function touchEnd(event: TouchEvent) {
-                document.removeEventListener("touchmove", touchMove);
-                document.removeEventListener("touchend", touchEnd);
-                touching = false;
-            }
-
-            document.addEventListener("touchmove", touchMove);
-            document.addEventListener("touchend", touchEnd);
-        });
-    }
-
-	/**Sets the relative scale of the canvas around a point*/
-	public scaleAround(scaleBy: number, point: Vector2, instantScale: boolean = false): Vector2
-	{
-		performance.mark('scaleAround-start');
-		// clamp scale by the min and max scale when applied to the current scale
-		const currentScale = this.targetScale;
+	/** Scale around a point (for pinch/wheel zoom) - immediate */
+	public scaleAroundImmediate(scaleBy: number, point: Vector2): void {
+		this.cancelAnimation();
+		const currentScale = this._scale;
 		let newScale = currentScale * scaleBy;
-		newScale = Math.min(Math.max(newScale, this.minScale), this.maxScale);
+		newScale = Math.min(Math.max(newScale, this._minScale), this._maxScale);
 		scaleBy = newScale / currentScale;
-		
-		// calculate offset after scaling
-		const centerToPoint = point.sub(this.targetPosition);
-		const centerPin = centerToPoint.scale(scaleBy).add(this.targetPosition);
+
+		const centerToPoint = point.sub(this._position);
+		const centerPin = centerToPoint.scale(scaleBy).add(this._position);
 		const offset = point.sub(centerPin);
 
-		if (instantScale)
-		{
-			this.scale *= scaleBy;
-			this.targetScale =  this.scale;
-			this.forcePosition = this.forcePosition.add(offset);
+		this._scale = newScale;
+		this._targetScale = newScale;
+		this._position = this._position.add(offset);
+		this._targetPosition = this._position;
+
+		this.updateSmallScaleClass();
+		this.applyTransform();
+	}
+
+	/** Fit view to bounds immediately */
+	public fitToView(bounds: Bounds, scaleMultiplier: number = SCALE_MULTIPLIER_DEFAULT): void {
+		this.refreshWrapperRect();
+		const width = this._wrapperRect?.width ?? this.document.containerEl.clientWidth;
+		const height = this._wrapperRect?.height ?? this.document.containerEl.clientHeight;
+
+		const xRatio = width / bounds.width;
+		const yRatio = height / bounds.height;
+		let scale = scaleMultiplier * Math.min(xRatio, yRatio);
+		scale = Math.max(this._minScale, Math.min(this._maxScale, scale));
+
+		const screenCenter = new Vector2(width / 2, height / 2);
+		const targetPos = screenCenter.sub(bounds.center.scale(scale));
+
+		this.setScaleImmediate(scale);
+		this.setPositionImmediate(targetPos);
+	}
+
+	/** Animate to view bounds (smooth transition) - used for double-click */
+	public animateToView(bounds: Bounds, scaleMultiplier: number = SCALE_MULTIPLIER_DEFAULT): void {
+		this.refreshWrapperRect();
+		const width = this._wrapperRect?.width ?? this.document.containerEl.clientWidth;
+		const height = this._wrapperRect?.height ?? this.document.containerEl.clientHeight;
+
+		const xRatio = width / bounds.width;
+		const yRatio = height / bounds.height;
+		let scale = scaleMultiplier * Math.min(xRatio, yRatio);
+		scale = Math.max(this._minScale, Math.min(this._maxScale, scale));
+
+		const screenCenter = new Vector2(width / 2, height / 2);
+		const targetPos = screenCenter.sub(bounds.center.scale(scale));
+
+		this.setTargetScale(scale);
+		this.setTargetPosition(targetPos);
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// EVENTS
+	// ═══════════════════════════════════════════════════════════════════════
+
+	private initEvents(): void {
+		// touch-action and user-select now handled by CSS (.canvas-export-mode)
+
+		const pointers = new Map<number, Vector2>();
+		let lastCenter: Vector2 | null = null;
+		let lastDistance = 0;
+
+		const getPointerPos = (e: PointerEvent): Vector2 => {
+			const rect = this._wrapperRect!;
+			return new Vector2(e.clientX - rect.left, e.clientY - rect.top);
+		};
+
+		const getCenter = (): Vector2 => {
+			const pts = Array.from(pointers.values());
+			if (pts.length === 0) return new Vector2(0, 0);
+			if (pts.length === 1) return pts[0];
+			return pts[0].add(pts[1]).scale(0.5);
+		};
+
+		const getDistance = (): number => {
+			const pts = Array.from(pointers.values());
+			if (pts.length < 2) return 0;
+			return Vector2.distance(pts[0], pts[1]);
+		};
+
+		this.wrapperEl.addEventListener('pointerdown', (e: PointerEvent) => {
+			if (e.button === 1) return; // Skip middle mouse button
+
+			// Don't capture if clicking on interactive elements (links, buttons, inputs)
+			const target = e.target as HTMLElement;
+			if (target.closest('a, button, input, textarea, [onclick], [role="button"]')) {
+				return; // Let the click through to the element
+			}
+
+			this.wrapperEl.setPointerCapture(e.pointerId);
+			this.refreshWrapperRect();
+			pointers.set(e.pointerId, getPointerPos(e));
+			lastCenter = getCenter();
+			lastDistance = getDistance();
+			this.bumpInteraction();
+		});
+
+		this.wrapperEl.addEventListener('pointermove', (e: PointerEvent) => {
+			if (!pointers.has(e.pointerId)) return;
+
+			this.refreshWrapperRect();
+			pointers.set(e.pointerId, getPointerPos(e));
+			const center = getCenter();
+			const distance = getDistance();
+
+			// Pan - immediate for responsiveness
+			if (lastCenter) {
+				const delta = center.sub(lastCenter);
+				this._position = this._position.add(delta);
+				this._targetPosition = this._position;
+			}
+
+			// Pinch zoom
+			if (pointers.size >= 2 && lastDistance > 0 && distance > 0) {
+				const scaleDelta = distance / lastDistance;
+				this.scaleAroundImmediate(scaleDelta, center);
+			} else {
+				this.applyTransform();
+			}
+
+			lastCenter = center;
+			lastDistance = distance;
+			this.bumpInteraction();
+		});
+
+		const onPointerUp = (e: PointerEvent) => {
+			pointers.delete(e.pointerId);
+			this.wrapperEl.releasePointerCapture(e.pointerId);
+			lastCenter = pointers.size > 0 ? getCenter() : null;
+			lastDistance = getDistance();
+		};
+
+		this.wrapperEl.addEventListener('pointerup', onPointerUp);
+		this.wrapperEl.addEventListener('pointercancel', onPointerUp);
+
+		// Wheel zoom - immediate
+		this.wrapperEl.addEventListener('wheel', (e: WheelEvent) => {
+			this.bumpInteraction();
+			this.refreshWrapperRect();
+			const scale = 1 - e.deltaY / WHEEL_SCALE_DIVISOR;
+			const pos = new Vector2(
+				e.clientX - this._wrapperRect!.left,
+				e.clientY - this._wrapperRect!.top
+			);
+			this.scaleAroundImmediate(scale, pos);
+		}, { passive: true });
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// CLEANUP
+	// ═══════════════════════════════════════════════════════════════════════
+
+	public destroy(): void {
+		// Clear animation
+		this.cancelAnimation();
+
+		// Clear interaction timeout
+		if (this._interactionIdleTimeoutId !== null) {
+			clearTimeout(this._interactionIdleTimeoutId);
+			this._interactionIdleTimeoutId = null;
 		}
-		else
-		{
-			this.targetScale *= scaleBy;
-			this.targetPosition = this.targetPosition.add(offset);
+
+		// Disconnect resize observer
+		if (this._resizeObserver) {
+			this._resizeObserver.disconnect();
+			this._resizeObserver = null;
 		}
 
-		performance.mark('scaleAround-end');
-		return offset;
-	}
-
-	public setScaleAround(scale: number, point: Vector2, instant: boolean = false)
-	{
-		this.scaleAround(scale / this.targetScale, point, instant);
-	}
-
-	public fitToBounds(bounds: Bounds = this.nodeBounds, scaleMultiplier: number = 0.9, instant: boolean = false)
-	{
-		const documentWidth = this.document.containerEl.clientWidth;
-		const documentHeight = this.document.containerEl.clientHeight;
-		const xRatio = documentWidth/bounds.width;
-		const yRatio = documentHeight/bounds.height;
-		const scale = scaleMultiplier * Math.min(xRatio, yRatio);
-		this.scaleAround(scale, bounds.center, instant);
-		this.centerView(bounds.center, instant);
-	}
-
-	/**Sets the absolute center of the view*/
-	private centerView(center: Vector2, instant: boolean = false)
-	{
-		const offset = this.wrapperBounds.center.sub(center);
-		if (instant) this.forcePosition = this.forcePosition.add(offset);
-		else this.targetPosition = this.targetPosition.add(offset);
+		// Remove scroll listener
+		window.removeEventListener("scroll", this._handleRectDirty, { capture: true } as EventListenerOptions);
 	}
 }

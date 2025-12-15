@@ -459,24 +459,47 @@ body :is(.canvas-node-container, .canvas-wrapper) {
 	cursor: unset !important;
 }
 
-body .canvas-wrapper {
+/* Canvas wrapper - document container for canvas views */
+.canvas-wrapper {
 	max-width: 100% !important;
 	contain: paint;
 }
 
+/* Canvas wrapper in export mode - fills container, hidden until ready */
+.canvas-wrapper.canvas-export-mode {
+	opacity: 0;
+	transition: none;
+}
+
+.canvas-wrapper.canvas-export-mode.canvas-ready {
+	transition: opacity 0.5s;
+	opacity: 1;
+}
+
+/* Document element when hosting a canvas */
+.obsidian-document.canvas-document {
+	position: absolute;
+	width: 100%;
+	height: 100%;
+	overflow: hidden;
+	top: 0;
+	left: 0;
+}
+
 .canvas {
-	will-change: is-interacting;
-	contain: layout style;
 	background-color: var(--background-primary);
+	transition: transform 200ms ease-out;
+	transform-origin: 0 0;
+}
+
+/* During interaction: enable GPU layer, disable transition for immediate response */
+.canvas.is-interacting {
+	will-change: transform;
+	transition: none;
 }
 
 .canvas-background {
 	display: none !important;
-}
-
-/* Isolate layout recalculation to individual canvas nodes */
-.canvas-node {
-	contain: layout style;
 }
 
 .canvas-node-container,
@@ -507,8 +530,44 @@ body .canvas-wrapper {
 	pointer-events: none;
 }
 
+/* Canvas wrapper interaction styles */
+.canvas-wrapper.canvas-export-mode {
+	touch-action: none;
+	user-select: none;
+}
+
+/*
+ * Small-scale approach A: CSS Custom Property
+ * Allows smooth interpolation via JS setting --small-scale-factor
+ */
+.canvas {
+	--small-scale-factor: 0;
+}
+
+.canvas.small-scale-var :is(.canvas-node-label, .canvas-path-label) {
+	opacity: calc(1 - var(--small-scale-factor));
+	transition: opacity 100ms ease-out;
+}
+
+.canvas.small-scale-var .obsidian-document {
+	opacity: calc(1 - var(--small-scale-factor) * 0.7);
+	transition: opacity 100ms ease-out;
+}
+
+/*
+ * Small-scale approach B: Class toggle
+ * Binary on/off, simpler but no interpolation
+ */
 .canvas.small-scale :is(.canvas-node-label, .canvas-path-label, .obsidian-document) {
-	display: none;
+	visibility: hidden;
+	opacity: 0;
+	pointer-events: none;
+}
+
+/* Force content rendering at small scale - content-visibility:auto skips offscreen/tiny content */
+.canvas.small-scale .canvas-node-container,
+.canvas.small-scale .canvas-node-content {
+	content-visibility: visible;
 }
 
 /*#endregion */
